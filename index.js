@@ -6,7 +6,8 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 
 import pino from "pino";
-import qrcode from "qrcode-terminal";
+import qrcodeTerminal from "qrcode-terminal";
+import QRCode from "qrcode";
 import express from "express";
 
 // ============================================================
@@ -30,6 +31,10 @@ let sock = null;
 let whatsappConnected = false;
 let reconnectTimer = null;
 
+// Stores the latest QR temporarily in memory.
+// Once WhatsApp connects, this is cleared.
+let latestQR = null;
+
 // ============================================================
 // WHATSAPP CONNECTION
 // ============================================================
@@ -37,8 +42,13 @@ let reconnectTimer = null;
 async function connectWhatsApp() {
   console.log("Starting WhatsApp gateway...");
 
-  // auth_info stores the linked-device session.
-  // Do NOT upload this folder publicly.
+  // Locally:
+  // ./auth_info
+  //
+  // Railway:
+  // mount persistent volume at /app/auth_info
+  //
+  // This keeps the WhatsApp linked-device session.
   const { state, saveCreds } =
     await useMultiFileAuthState("./auth_info");
 
@@ -71,24 +81,29 @@ async function connectWhatsApp() {
         qr,
       } = update;
 
-      // --------------------------------------------------------
-      // QR CODE
-      // --------------------------------------------------------
+      // ========================================================
+      // QR CODE GENERATED
+      // ========================================================
 
       if (qr) {
+        // Save QR so the /qr endpoint can display it
+        latestQR = qr;
+
         console.log(
           "\n================================="
         );
 
         console.log(
-          "📱 SCAN THIS QR CODE"
+          "📱 WHATSAPP QR GENERATED"
         );
 
         console.log(
           "=================================\n"
         );
 
-        qrcode.generate(
+        // Still display QR locally in the terminal.
+        // Useful when running node index.js on your computer.
+        qrcodeTerminal.generate(
           qr,
           {
             small: true,
@@ -106,12 +121,15 @@ async function connectWhatsApp() {
         console.log();
       }
 
-      // --------------------------------------------------------
+      // ========================================================
       // CONNECTED
-      // --------------------------------------------------------
+      // ========================================================
 
       if (connection === "open") {
         whatsappConnected = true;
+
+        // QR is no longer needed
+        latestQR = null;
 
         if (reconnectTimer) {
           clearTimeout(reconnectTimer);
@@ -136,9 +154,9 @@ async function connectWhatsApp() {
         );
       }
 
-      // --------------------------------------------------------
+      // ========================================================
       // DISCONNECTED
-      // --------------------------------------------------------
+      // ========================================================
 
       if (connection === "close") {
         whatsappConnected = false;
@@ -163,34 +181,24 @@ async function connectWhatsApp() {
           DisconnectReason.loggedOut;
 
         if (loggedOut) {
+          latestQR = null;
+
           console.log(
             "❌ WhatsApp account was logged out."
           );
 
           console.log(
-            "To connect again:"
+            "The account must be paired again."
           );
 
           console.log(
-            "1. Stop the server"
-          );
-
-          console.log(
-            "2. Delete the auth_info folder"
-          );
-
-          console.log(
-            "3. Run node index.js"
-          );
-
-          console.log(
-            "4. Scan the new QR code"
+            "If necessary, clear auth_info and restart the gateway."
           );
 
           return;
         }
 
-        // Avoid creating multiple reconnect timers
+        // Prevent multiple reconnect timers
         if (!reconnectTimer) {
           console.log(
             "Trying to reconnect in 3 seconds..."
@@ -207,6 +215,7 @@ async function connectWhatsApp() {
                     error
                   );
                 });
+
             }, 3000);
         }
       }
@@ -225,6 +234,20 @@ app.use(
     limit: "1mb",
   })
 );
+
+// ============================================================
+// AUTHENTICATION HELPER
+// ============================================================
+
+function isAuthorized(req) {
+  const authorization =
+    req.headers.authorization;
+
+  return (
+    authorization ===
+    `Bearer ${API_SECRET}`
+  );
+}
 
 // ============================================================
 // HOME
@@ -266,7 +289,224 @@ app.get(
         whatsappConnected
           ? sock?.user?.id ?? null
           : null,
+
+      qr_available:
+        Boolean(latestQR),
     });
+  }
+);
+
+// ============================================================
+// QR CODE
+// ============================================================
+//
+// Protected endpoint.
+//
+// IMPORTANT:
+// Do NOT put API_SECRET in the URL.
+//
+// Request:
+// GET /qr
+//
+// Header:
+// Authorization: Bearer YOUR_API_SECRET
+//
+// ============================================================
+
+app.get(
+  "/qr",
+  async (req, res) => {
+
+    // ----------------------------------------------------------
+    // AUTHENTICATION
+    // ----------------------------------------------------------
+
+    if (!isAuthorized(req)) {
+      console.log(
+        "❌ Unauthorized /qr request"
+      );
+
+      return res
+        .status(401)
+        .send("Unauthorized");
+    }
+
+    // ----------------------------------------------------------
+    // ALREADY CONNECTED
+    // ----------------------------------------------------------
+
+    if (whatsappConnected) {
+      return res.send(`
+        <!DOCTYPE html>
+
+        <html>
+          <head>
+            <title>WhatsApp Gateway</title>
+
+            <meta
+              name="viewport"
+              content="width=device-width, initial-scale=1"
+            >
+          </head>
+
+          <body
+            style="
+              font-family: Arial, sans-serif;
+              text-align: center;
+              padding: 50px;
+            "
+          >
+
+            <h1>
+              ✅ WhatsApp Connected
+            </h1>
+
+            <p>
+              The gateway is already linked
+              to WhatsApp.
+            </p>
+
+          </body>
+        </html>
+      `);
+    }
+
+    // ----------------------------------------------------------
+    // WAITING FOR QR
+    // ----------------------------------------------------------
+
+    if (!latestQR) {
+      return res.send(`
+        <!DOCTYPE html>
+
+        <html>
+          <head>
+            <title>WhatsApp Gateway</title>
+
+            <meta
+              name="viewport"
+              content="width=device-width, initial-scale=1"
+            >
+
+            <meta
+              http-equiv="refresh"
+              content="5"
+            >
+          </head>
+
+          <body
+            style="
+              font-family: Arial, sans-serif;
+              text-align: center;
+              padding: 50px;
+            "
+          >
+
+            <h2>
+              Waiting for WhatsApp QR...
+            </h2>
+
+            <p>
+              The page will refresh automatically.
+            </p>
+
+          </body>
+        </html>
+      `);
+    }
+
+    // ----------------------------------------------------------
+    // GENERATE QR IMAGE
+    // ----------------------------------------------------------
+
+    try {
+      const qrImage =
+        await QRCode.toDataURL(
+          latestQR,
+          {
+            width: 400,
+            margin: 2,
+          }
+        );
+
+      return res.send(`
+        <!DOCTYPE html>
+
+        <html>
+          <head>
+
+            <title>
+              WhatsApp Gateway Pairing
+            </title>
+
+            <meta
+              name="viewport"
+              content="width=device-width, initial-scale=1"
+            >
+
+          </head>
+
+          <body
+            style="
+              font-family: Arial, sans-serif;
+              text-align: center;
+              padding: 30px;
+            "
+          >
+
+            <h1>
+              WhatsApp Gateway
+            </h1>
+
+            <h2>
+              📱 Pair WhatsApp
+            </h2>
+
+            <p>
+              On your phone open:
+            </p>
+
+            <p>
+              <strong>
+                WhatsApp →
+                Settings →
+                Linked Devices →
+                Link a Device
+              </strong>
+            </p>
+
+            <img
+              src="${qrImage}"
+              width="400"
+              height="400"
+              alt="WhatsApp QR Code"
+              style="
+                max-width: 90%;
+                height: auto;
+              "
+            >
+
+            <p>
+              If the QR expires,
+              request /qr again.
+            </p>
+
+          </body>
+        </html>
+      `);
+
+    } catch (error) {
+      console.error(
+        "QR generation error:",
+        error
+      );
+
+      return res
+        .status(500)
+        .send(
+          "Failed to generate QR code"
+        );
+    }
   }
 );
 
@@ -282,13 +522,7 @@ app.post(
     // AUTHENTICATION
     // ----------------------------------------------------------
 
-    const authorization =
-      req.headers.authorization;
-
-    if (
-      authorization !==
-      `Bearer ${API_SECRET}`
-    ) {
+    if (!isAuthorized(req)) {
       console.log(
         "❌ Unauthorized /send request"
       );
@@ -304,7 +538,7 @@ app.post(
     try {
 
       // --------------------------------------------------------
-      // CHECK WHATSAPP CONNECTION
+      // CHECK CONNECTION
       // --------------------------------------------------------
 
       if (
@@ -355,15 +589,15 @@ app.post(
           });
       }
 
-      // --------------------------------------------------------
-      // RECIPIENT LIST
-      // --------------------------------------------------------
+      // ========================================================
+      // RECIPIENTS
+      // ========================================================
 
-      // Accept:
+      // Supports:
       //
       // "to": "+9665..."
       //
-      // OR
+      // OR:
       //
       // "to": [
       //   "+9665...",
@@ -393,15 +627,11 @@ app.post(
         `Sending WhatsApp message to ${recipients.length} recipient(s)`
       );
 
-      // --------------------------------------------------------
-      // SEND RESULTS
-      // --------------------------------------------------------
-
       const results = [];
 
-      // --------------------------------------------------------
-      // SEND TO EACH RECIPIENT
-      // --------------------------------------------------------
+      // ========================================================
+      // SEND ONE BY ONE
+      // ========================================================
 
       for (
         let i = 0;
@@ -414,15 +644,9 @@ app.post(
         // Remove:
         // +
         // spaces
-        // -
+        // dashes
         // brackets
         // etc.
-        //
-        // +966 50 123 4567
-        //
-        // becomes:
-        //
-        // 966501234567
 
         const cleanNumber =
           String(recipient)
@@ -500,9 +724,9 @@ app.post(
           });
         }
 
-        // ------------------------------------------------------
-        // SMALL DELAY BETWEEN RECIPIENTS
-        // ------------------------------------------------------
+        // ======================================================
+        // DELAY BETWEEN RECIPIENTS
+        // ======================================================
 
         if (
           i <
@@ -518,9 +742,9 @@ app.post(
         }
       }
 
-      // --------------------------------------------------------
-      // SUMMARY
-      // --------------------------------------------------------
+      // ========================================================
+      // RESULT SUMMARY
+      // ========================================================
 
       const sent =
         results.filter(
@@ -590,11 +814,11 @@ app.listen(
     );
 
     console.log(
-      `API: http://localhost:${PORT}`
+      `Port: ${PORT}`
     );
 
     console.log(
-      `Health: http://localhost:${PORT}/health`
+      `Local health check: http://localhost:${PORT}/health`
     );
 
     console.log();
